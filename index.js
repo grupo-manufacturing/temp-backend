@@ -284,18 +284,22 @@ app.post('/onboard-user', async (req, res) => {
     }
 
     // Mandatory for receiving events for this WABA on your webhook endpoint.
+    // Prefer system user token in production; fallback to onboarded user token.
     try {
       await axios.post(
         `https://graph.facebook.com/v19.0/${wabaId}/subscribed_apps`,
         null,
-        auth
+        {
+          headers: { Authorization: `Bearer ${SYSTEM_USER_TOKEN || access_token}` }
+        }
       );
-      console.log('Subscribed app to WABA webhook events:', wabaId);
+      console.log(
+        'Subscribed app to WABA webhook events:',
+        wabaId,
+        SYSTEM_USER_TOKEN ? '(system token)' : '(user token fallback)'
+      );
     } catch (e) {
-      console.warn(
-        'WABA subscribed_apps failed:',
-        e.response?.data || e.message
-      );
+      console.warn('WABA subscribed_apps failed:', e.response?.data || e.message);
     }
 
     console.log(
@@ -330,6 +334,15 @@ function handleWebhookVerify(req, res) {
   const mode = req.query['hub.mode'];
   const token = req.query['hub.verify_token'];
   const challenge = req.query['hub.challenge'];
+
+  // Friendly response when opened manually in a browser
+  if (!mode && !token && !challenge) {
+    return res.status(200).json({
+      ok: true,
+      endpoint: '/webhook',
+      info: 'Use query params for Meta webhook verification'
+    });
+  }
 
   if (mode === 'subscribe' && token === WEBHOOK_VERIFY_TOKEN) {
     console.log('Webhook verified');
