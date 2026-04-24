@@ -439,6 +439,30 @@ app.get('/debug/subscribed-apps/:wabaId', async (req, res) => {
   res.json(results);
 });
 
+app.get('/debug/phone/:phoneNumberId', async (req, res) => {
+  const { phoneNumberId } = req.params;
+  const token = lastOnboardedUser?.accessToken || SYSTEM_USER_TOKEN;
+
+  try {
+    const response = await axios.get(
+      `https://graph.facebook.com/v19.0/${phoneNumberId}`,
+      {
+        headers: { Authorization: `Bearer ${token}` },
+        params: {
+          fields:
+            'id,display_phone_number,verified_name,quality_rating,code_verification_status,name_status,new_name_status,platform_type,status'
+        }
+      }
+    );
+    res.json(response.data);
+  } catch (error) {
+    res.status(500).json({
+      error: 'Failed to fetch phone number details',
+      details: error.response?.data || error.message
+    });
+  }
+});
+
 // Check what callback URL Meta currently has for the app
 app.get('/debug/app-webhook', async (req, res) => {
   try {
