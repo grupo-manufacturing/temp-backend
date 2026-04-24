@@ -35,24 +35,6 @@ const PHONE_NUMBER_ID = process.env.WHATSAPP_PHONE_NUMBER_ID || '';
 const WEBHOOK_VERIFY_TOKEN = process.env.WEBHOOK_VERIFY_TOKEN || '';
 const WEBHOOK_CALLBACK_URL = process.env.WEBHOOK_CALLBACK_URL || '';
 
-function buildWebhookOverrideCandidates(url) {
-  if (!url) return [];
-  const out = [];
-  const add = (u) => {
-    if (u && !out.includes(u)) out.push(u);
-  };
-  const trimmed = url.trim();
-  add(trimmed);
-  add(trimmed.replace(/\/+$/, ''));
-  try {
-    const u = new URL(trimmed);
-    add(`${u.origin}/webhook`);
-    add(u.origin);
-  } catch (_) {
-  }
-  return out;
-}
-
 const app = express();
 app.use(cors());
 app.use(bodyParser.json());
@@ -316,53 +298,10 @@ app.post('/onboard-user', async (req, res) => {
       );
     }
 
-    if (WEBHOOK_CALLBACK_URL) {
-      // Try each candidate URL with each token (System User first, then user token).
-      // Meta requires the override to be set by the app's System User token.
-      const candidates = buildWebhookOverrideCandidates(WEBHOOK_CALLBACK_URL);
-      const tokens = [
-        { label: 'SYSTEM_USER_TOKEN', value: SYSTEM_USER_TOKEN },
-        { label: 'user access_token', value: access_token }
-      ];
-      let overrideApplied = false;
-      outer: for (const { label, value: tok } of tokens) {
-        for (const candidate of candidates) {
-          try {
-            const form = new URLSearchParams();
-            form.set('override_callback_uri', candidate);
-            form.set('verify_token', WEBHOOK_VERIFY_TOKEN);
-            await axios.post(
-              `https://graph.facebook.com/v19.0/${wabaId}/subscribed_apps`,
-              form.toString(),
-              {
-                headers: {
-                  Authorization: `Bearer ${tok}`,
-                  'Content-Type': 'application/x-www-form-urlencoded'
-                }
-              }
-            );
-            console.log(`Applied WABA webhook override (${label}):`, candidate);
-            overrideApplied = true;
-            break outer;
-          } catch (e) {
-            console.warn(
-              `WABA override_callback_uri failed [${label}] ${candidate}:`,
-              e.response?.data || e.message
-            );
-          }
-        }
-      }
-      if (!overrideApplied) {
-        console.warn(
-          'All override attempts failed. Falling back to app-level webhook.',
-          '\nACTION REQUIRED: In Meta App Dashboard → WhatsApp → Configuration,',
-          'set Callback URL to:', WEBHOOK_CALLBACK_URL,
-          'and Verify token to:', WEBHOOK_VERIFY_TOKEN
-        );
-      }
-    } else {
-      console.log('WEBHOOK_CALLBACK_URL not set; using app-level callback URL only.');
-    }
+    console.log(
+      'Using app-level webhook configuration from Meta Dashboard.',
+      WEBHOOK_CALLBACK_URL ? `Configured callback hint: ${WEBHOOK_CALLBACK_URL}` : ''
+    );
 
     lastOnboardedUser = {
       wabaId,
@@ -401,7 +340,13 @@ function handleWebhookVerify(req, res) {
 }
 
 app.get('/webhook', handleWebhookVerify);
-app.get('/', handleWebhookVerify);
+app.get('/', (req, res) => {
+  res.status(200).json({
+    ok: true,
+    service: 'responza-backend',
+    webhook_verify_endpoint: '/webhook'
+  });
+});
 
 // -------------------------------
 // Receive messages
