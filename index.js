@@ -176,7 +176,7 @@ async function onboardInstagramUser(accessToken, userId) {
     throw e;
   }
 
-  let subscribeResult = { ok: false };
+  let subscribeResult = { ok: false, optional: true };
   try {
     const subRes = await axios.post(
       `https://graph.facebook.com/v19.0/${igId}/subscribed_apps`,
@@ -189,8 +189,23 @@ async function onboardInstagramUser(accessToken, userId) {
     );
     subscribeResult = { ok: true, details: subRes.data };
   } catch (e) {
-    console.warn('IG subscribed_apps failed:', e.response?.data || e.message);
-    subscribeResult = { ok: false, details: e.response?.data || e.message };
+    const graphErr = e.response?.data?.error || {};
+    const isUnsupportedSubscribedApps =
+      Number(graphErr.code) === 100 && Number(graphErr.error_subcode) === 33;
+
+    if (isUnsupportedSubscribedApps) {
+      console.log(
+        'IG subscribed_apps not supported for this IG user object in current setup; continuing without it.'
+      );
+    } else {
+      console.warn('IG subscribed_apps failed:', e.response?.data || e.message);
+    }
+
+    subscribeResult = {
+      ok: false,
+      optional: true,
+      details: e.response?.data || e.message
+    };
   }
 
   lastInstagramOnboardedUser = {
@@ -204,6 +219,7 @@ async function onboardInstagramUser(accessToken, userId) {
     igUserId: igId,
     igUsername,
     subscribed: subscribeResult.ok,
+    subscriptionOptional: true,
     subscribeDetails: subscribeResult.details
   };
 }
