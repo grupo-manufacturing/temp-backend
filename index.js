@@ -6,7 +6,6 @@ const fs = require('fs');
 const path = require('path');
 const crypto = require('crypto');
 
-// Load .env if present (KEY=value lines; does not override existing process.env)
 (function loadLocalEnv() {
   try {
     const envPath = path.join(__dirname, '.env');
@@ -30,10 +29,16 @@ const crypto = require('crypto');
 
 const FACEBOOK_APP_ID = process.env.FACEBOOK_APP_ID || '';
 const FACEBOOK_APP_SECRET = process.env.FACEBOOK_APP_SECRET || '';
+const INSTAGRAM_APP_ID = process.env.INSTAGRAM_APP_ID || '1438252244655087';
+const INSTAGRAM_APP_SECRET = process.env.INSTAGRAM_APP_SECRET || '376e2336082a7abc44fb4b448491da46';
+const INSTAGRAM_REDIRECT_URI =
+  process.env.INSTAGRAM_REDIRECT_URI ||
+  'https://temp-backend-idyb.onrender.com/auth/instagram/callback';
 const SYSTEM_USER_TOKEN = process.env.SYSTEM_USER_TOKEN || '';
 const PHONE_NUMBER_ID = process.env.WHATSAPP_PHONE_NUMBER_ID || '';
 const WEBHOOK_VERIFY_TOKEN = process.env.WEBHOOK_VERIFY_TOKEN || '';
 const WEBHOOK_CALLBACK_URL = process.env.WEBHOOK_CALLBACK_URL || '';
+const FRONTEND_CALLBACK_ORIGIN = process.env.FRONTEND_CALLBACK_ORIGIN || '*';
 
 const app = express();
 app.use(cors());
@@ -43,6 +48,7 @@ const MAX_MESSAGES = 200;
 let messages = [];
 let webhookEvents = [];
 let lastOnboardedUser = null;
+let lastInstagramOnboardedUser = null;
 
 const ONBOARD_PERMISSION_HINT = [
   'Add these to your Embedded Signup configuration (App Dashboard → WhatsApp → the config matching config_id) and to Facebook Login: business_management, whatsapp_business_management, whatsapp_business_messaging.',
@@ -106,6 +112,205 @@ app.post('/exchange-token', async (req, res) => {
       error: 'Token exchange failed',
       details: err.response?.data
     });
+  }
+});
+
+// -------------------------------
+// Instagram OAuth code -> short-lived token
+// -------------------------------
+app.post('/instagram/exchange-token', async (req, res) => {
+  const { code } = req.body;
+  if (!code) {
+    return res.status(400).json({ error: 'code is required' });
+  }
+  if (!INSTAGRAM_APP_SECRET) {
+    return res.status(500).json({
+      error: 'Set INSTAGRAM_APP_SECRET (or FACEBOOK_APP_SECRET) in backend .env'
+    });
+  }
+
+  try {
+    const form = new URLSearchParams();
+    form.append('client_id', INSTAGRAM_APP_ID);
+    form.append('client_secret', INSTAGRAM_APP_SECRET);
+    form.append('grant_type', 'authorization_code');
+    form.append('redirect_uri', INSTAGRAM_REDIRECT_URI);
+    form.append('code', code);
+
+    const { data } = await axios.post(
+      'https://api.instagram.com/oauth/access_token',
+      form.toString(),
+      { headers: { 'Content-Type': 'application/x-www-form-urlencoded' } }
+    );
+
+    res.json({
+      access_token: data.access_token,
+      user_id: data.user_id,
+      permissions: data.permissions || null
+    });
+  } catch (err) {
+    console.error('IG EXCHANGE ERROR:', err.response?.data || err.message);
+    res.status(500).json({
+      error: 'Instagram token exchange failed',
+      details: err.response?.data
+    });
+  }
+});
+
+async function onboardInstagramUser(accessToken, userId) {
+  let igId = userId || null;
+  const meRes = await axios.get('https://graph.instagram.com/me', {
+    params: {
+      fields: 'user_id,username',
+      access_token: accessToken
+    }
+  });
+
+  const me = meRes.data || {};
+  igId = igId || me.user_id || null;
+  const igUsername = me.username || null;
+
+  if (!igId) {
+    const e = new Error('Instagram user_id could not be resolved from token');
+    e.statusCode = 400;
+    throw e;
+  }
+
+  let subscribeResult = { ok: false };
+  try {
+    const subRes = await axios.post(
+      `https://graph.facebook.com/v19.0/${igId}/subscribed_apps`,
+      null,
+      {
+        headers: {
+          Authorization: `Bearer ${SYSTEM_USER_TOKEN || accessToken}`
+        }
+      }
+    );
+    subscribeResult = { ok: true, details: subRes.data };
+  } catch (e) {
+    console.warn('IG subscribed_apps failed:', e.response?.data || e.message);
+    subscribeResult = { ok: false, details: e.response?.data || e.message };
+  }
+
+  lastInstagramOnboardedUser = {
+    igUserId: igId,
+    igUsername,
+    accessToken,
+    subscribed: subscribeResult.ok
+  };
+
+  return {
+    igUserId: igId,
+    igUsername,
+    subscribed: subscribeResult.ok,
+    subscribeDetails: subscribeResult.details
+  };
+}
+
+// -------------------------------
+// Instagram onboarding: resolve account + subscribe app
+// -------------------------------
+app.post('/instagram/onboard-user', async (req, res) => {
+  const { access_token, user_id } = req.body;
+  if (!access_token) {
+    return res.status(400).json({ error: 'access_token is required' });
+  }
+
+  try {
+    const data = await onboardInstagramUser(access_token, user_id);
+    res.json(data);
+  } catch (err) {
+    const statusCode = err.statusCode || 500;
+    console.error('IG ONBOARD ERROR:', err.response?.data || err.message);
+    res.status(statusCode).json({
+      error: 'Instagram onboarding failed',
+      details: err.response?.data || err.message
+    });
+  }
+});
+
+// -------------------------------
+// Instagram OAuth redirect callback
+// -------------------------------
+app.get('/auth/instagram/callback', async (req, res) => {
+  const code = req.query.code;
+  const oauthError = req.query.error || req.query.error_reason;
+
+  if (oauthError) {
+    return res.status(200).send(`<!doctype html>
+<html><body style="font-family:system-ui;padding:20px;background:#0b1020;color:#fff;">
+  <h3>Instagram login canceled</h3>
+  <p>You can close this window and retry.</p>
+  <script>
+    if (window.opener) {
+      window.opener.postMessage(${JSON.stringify({
+        type: 'INSTAGRAM_BUSINESS_LOGIN',
+        status: 'error',
+        error: 'Instagram authorization was canceled'
+      })}, ${JSON.stringify(FRONTEND_CALLBACK_ORIGIN)});
+    }
+  </script>
+</body></html>`);
+  }
+
+  if (!code) {
+    return res.status(400).send('Missing code query parameter');
+  }
+
+  try {
+    const form = new URLSearchParams();
+    form.append('client_id', INSTAGRAM_APP_ID);
+    form.append('client_secret', INSTAGRAM_APP_SECRET);
+    form.append('grant_type', 'authorization_code');
+    form.append('redirect_uri', INSTAGRAM_REDIRECT_URI);
+    form.append('code', String(code).replace(/#_$/, ''));
+
+    const tokenResp = await axios.post(
+      'https://api.instagram.com/oauth/access_token',
+      form.toString(),
+      { headers: { 'Content-Type': 'application/x-www-form-urlencoded' } }
+    );
+
+    const shortLived = tokenResp.data || {};
+    const onboardData = await onboardInstagramUser(shortLived.access_token, shortLived.user_id);
+
+    const payload = {
+      type: 'INSTAGRAM_BUSINESS_LOGIN',
+      status: 'success',
+      data: onboardData
+    };
+
+    return res.status(200).send(`<!doctype html>
+<html><body style="font-family:system-ui;padding:20px;background:#0b1020;color:#fff;">
+  <h3>Instagram connected</h3>
+  <p>You can close this window and continue in Responza.</p>
+  <script>
+    if (window.opener) {
+      window.opener.postMessage(${JSON.stringify(payload)}, ${JSON.stringify(FRONTEND_CALLBACK_ORIGIN)});
+      window.close();
+    }
+  </script>
+</body></html>`);
+  } catch (err) {
+    const detail = err.response?.data || err.message;
+    console.error('IG CALLBACK ERROR:', detail);
+    const payload = {
+      type: 'INSTAGRAM_BUSINESS_LOGIN',
+      status: 'error',
+      error: 'Instagram login flow failed',
+      details: detail
+    };
+    return res.status(200).send(`<!doctype html>
+<html><body style="font-family:system-ui;padding:20px;background:#0b1020;color:#fff;">
+  <h3>Instagram connection failed</h3>
+  <p>Please close this window and retry.</p>
+  <script>
+    if (window.opener) {
+      window.opener.postMessage(${JSON.stringify(payload)}, ${JSON.stringify(FRONTEND_CALLBACK_ORIGIN)});
+    }
+  </script>
+</body></html>`);
   }
 });
 
@@ -370,26 +575,67 @@ app.post('/webhook', (req, res) => {
     webhookEvents.splice(0, webhookEvents.length - 50);
   }
 
-  const entries = req.body?.entry || [];
-  for (const entry of entries) {
-    const changes = entry?.changes || [];
-    for (const change of changes) {
-      const field = change?.field;
-      if (field) {
-        console.log('Webhook event field:', field);
-      }
+  const object = req.body?.object;
 
-      const value = change?.value || {};
-      const incoming = value?.messages || [];
-      const phoneNumberId = value?.metadata?.phone_number_id;
-      for (const msg of incoming) {
-        const text = msg.text?.body || 'non-text';
-        const tagged = phoneNumberId ? `[${phoneNumberId}] ${text}` : text;
-        messages.push(tagged);
-        if (messages.length > MAX_MESSAGES) {
-          messages.splice(0, messages.length - MAX_MESSAGES);
+  // -------------------------------
+  // WHATSAPP (existing logic)
+  // -------------------------------
+  if (object === 'whatsapp_business_account') {
+    const entries = req.body?.entry || [];
+
+    for (const entry of entries) {
+      const changes = entry?.changes || [];
+
+      for (const change of changes) {
+        const value = change?.value || {};
+        const incoming = value?.messages || [];
+        const phoneNumberId = value?.metadata?.phone_number_id;
+
+        for (const msg of incoming) {
+          const text = msg.text?.body || 'non-text';
+          const tagged = phoneNumberId ? `[WA:${phoneNumberId}] ${text}` : text;
+
+          messages.push(tagged);
+          if (messages.length > MAX_MESSAGES) {
+            messages.splice(0, messages.length - MAX_MESSAGES);
+          }
+
+          console.log('WhatsApp message:', tagged);
         }
-        console.log('Received message:', tagged);
+      }
+    }
+  }
+
+  // -------------------------------
+  // INSTAGRAM (NEW LOGIC)
+  // -------------------------------
+  if (object === 'instagram') {
+    const entries = req.body?.entry || [];
+
+    for (const entry of entries) {
+      const messaging = entry?.messaging || [];
+
+      for (const event of messaging) {
+        const senderId = event?.sender?.id;
+        const recipientId = event?.recipient?.id;
+
+        // Incoming message
+        if (event.message) {
+          const text = event.message?.text || 'non-text';
+          const tagged = `[IG:${senderId}] ${text}`;
+
+          messages.push(tagged);
+          if (messages.length > MAX_MESSAGES) {
+            messages.splice(0, messages.length - MAX_MESSAGES);
+          }
+
+          console.log('Instagram message:', tagged);
+        }
+
+        // Optional: postbacks (buttons, etc.)
+        if (event.postback) {
+          console.log('Instagram postback:', event.postback);
+        }
       }
     }
   }
@@ -408,11 +654,19 @@ app.get('/webhook-events', (req, res) => {
 app.get('/debug/state', (req, res) => {
   res.json({
     lastOnboardedUser,
+    lastInstagramOnboardedUser,
     defaultPhoneNumberId: PHONE_NUMBER_ID,
     webhookCallbackUrl: WEBHOOK_CALLBACK_URL || null,
     webhookVerifyTokenConfigured: Boolean(WEBHOOK_VERIFY_TOKEN),
     messagesCount: messages.length,
     webhookEventsCount: webhookEvents.length
+  });
+});
+
+app.get('/instagram/state', (req, res) => {
+  res.json({
+    connected: Boolean(lastInstagramOnboardedUser),
+    instagram: lastInstagramOnboardedUser
   });
 });
 
